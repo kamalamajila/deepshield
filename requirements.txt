@@ -1,0 +1,10 @@
+Flask
+Flask-SQLAlchemy
+psycopg2-binary
+opencv-python-headless
+mtcnn
+numpy
+scikit-image
+joblib
+imblearn
+gunicorn
