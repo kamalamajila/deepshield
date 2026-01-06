@@ -1,285 +1,320 @@
-from flask import flash, redirect, render_template, request, url_for, get_flashed_messages, Flask, session
-from flask_sqlalchemy import SQLAlchemy
-import os
-import psycopg2
-import cv2
-from mtcnn import MTCNN
-import random
-import imblearn
+from flask import Flask, request, jsonify, render_template
+import tensorflow as tf
 import numpy as np
-from skimage.metrics import normalized_root_mse, peak_signal_noise_ratio, structural_similarity
-import joblib
+import cv2
+import os
+from PIL import Image
+import logging
+from werkzeug.utils import secure_filename
 
-db_user = os.getenv("DB_USER")
-db_password = os.getenv("DB_PASSWORD")
-db_host = os.getenv("DB_HOST")
-db_port = os.getenv("DB_PORT")
-db_name = os.getenv("DB_NAME")
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CONFIGURATION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-app = Flask(__name__, template_folder="templates")
+app = Flask(__name__)
 
-app.config['SQLALCHEMY_DATABASE_URI'] = (f'postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}')
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False 
-app.secret_key = 'detection'
-app.config['SECRET_KEY'] = os.urandom(24)
+# Security & File Upload Settings
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
+app.config['UPLOAD_FOLDER'] = 'uploads'
 
-db = SQLAlchemy()
-db.init_app(app)
+ALLOWED_IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp'}
+ALLOWED_VIDEO_EXTENSIONS = {'mp4', 'mov', 'avi', 'mkv', 'flv', 'wmv'}
 
-db_config = {
-    'host': db_host,
-    'port': db_port,
-    'database': db_name,
-    'user': db_user,
-    'password': db_password
-}
+# Create uploads folder if it doesn't exist
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Model Configuration
+IMG_SIZE = 128
+FRAME_SKIP = 5
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# LOAD MODEL (CACHED)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 try:
-    connection = psycopg2.connect(
-        host=db_host,
-        user=db_user,
-        password=db_password,
-        database=db_name,
-        port=db_port
+    model = tf.keras.models.load_model(
+        "model/deepfake_model.h5",
+        compile=False
     )
-    cursor = connection.cursor()
-except:
-    connection = None
-    cursor = None
+    logger.info("✅ Model loaded successfully")
+except Exception as e:
+    logger.error(f"❌ Error loading model: {str(e)}")
+    model = None
 
-class User(db.Model):
-    __tablename__ = 'users'
-    id = db.Column(db.Integer, primary_key=True)
-    fullname = db.Column(db.String(80), nullable=False)
-    email = db.Column(db.String(120), unique=True, nullable=False)
-    password = db.Column(db.String(120), nullable=False)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# UTILITY FUNCTIONS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def allowed_file(filename, allowed_extensions):
+    """Check if file has allowed extension"""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in allowed_extensions
 
+def preprocess_image(img):
+    """Preprocess image for model prediction"""
+    try:
+        img = img.resize((IMG_SIZE, IMG_SIZE))
+        img = np.array(img) / 255.0
+        
+        # Handle grayscale images
+        if len(img.shape) == 2:
+            img = np.stack([img] * 3, axis=-1)
+        elif img.shape[2] == 4:  # RGBA
+            img = img[:, :, :3]
+        
+        return np.expand_dims(img, axis=0)
+    except Exception as e:
+        logger.error(f"Error preprocessing image: {str(e)}")
+        return None
 
-@app.route('/')
+def get_prediction_result(prediction_value):
+    """Convert prediction value to label and confidence"""
+    is_real = prediction_value > 0.5
+    confidence = float(prediction_value if is_real else 1 - prediction_value) * 100
+    label = "REAL" if is_real else "FAKE"
+    return label, round(confidence, 2)
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ROUTES
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@app.route("/")
 def index():
-    return render_template('index.html')
+    """Serve the main page"""
+    return render_template("index.html")
 
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if request.method == 'POST':
-        email = request.form['email']
-        password = request.form['password']
+@app.route("/health", methods=["GET"])
+def health():
+    """Health check endpoint"""
+    model_status = "loaded" if model is not None else "not_loaded"
+    return jsonify({
+        "status": "ok",
+        "model": model_status
+    }), 200
 
-        user = User.query.filter_by(email=email).first()
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# IMAGE PREDICTION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-        if user and user.password == password:
-            session['user_id'] = user.id
-            flash('Logged in successfully!', 'success')
-            return redirect(url_for('classify'))
-        else:
-            flash('Invalid email or password!', 'danger')
-
-    get_flashed_messages()
-
-    return render_template('login.html')
-
-
-@app.route('/signup', methods=['GET', 'POST'])
-def signup():
-    if request.method == 'POST':
-        fullname = request.form['fullname']
-        email = request.form['email']
-        password = request.form['password']
-        confirm_password = request.form['confirm-password']
-
-
-        if password != confirm_password:
-            flash('Passwords do not match!', 'danger')
-            return redirect(url_for('signup'))
-
-
-        new_user = User(fullname=fullname, email=email, password=password)
-        db.session.add(new_user)
-        db.session.commit()
-
-        flash('Registered successfully! Please login.', 'success')
-        return redirect(url_for('login'))
-
-    return render_template('signup.html')
-
-
-def croping_and_scaling(result, img):
-    left_eye_kp = result["keypoints"]["left_eye"]
-    right_eye_kp = result["keypoints"]["right_eye"]
-
-    eye_loc_percentage = (0.375, 0.375)
-    rescaled_img_width = 224
-
-    del_y_org = right_eye_kp[1] - left_eye_kp[1]
-    del_x_org = right_eye_kp[0] - left_eye_kp[0]
-    dist_org = np.sqrt((del_y_org * 2) + (del_x_org * 2))
-
-    rescaled_img_left_eye_kp = (eye_loc_percentage[0] * rescaled_img_width, eye_loc_percentage[1] * rescaled_img_width)
-    rescaled_img_right_eye_kp = ((1 - eye_loc_percentage[0]) * rescaled_img_width, eye_loc_percentage[1] * rescaled_img_width)
-
-    del_y_rescaled = rescaled_img_right_eye_kp[1] - rescaled_img_left_eye_kp[1]
-    del_x_rescaled = rescaled_img_right_eye_kp[0] - rescaled_img_left_eye_kp[0]
-    dist_rescaled = np.sqrt((del_y_rescaled) * 2 + (del_x_rescaled) * 2)
-
-    scaling_factor = dist_rescaled / dist_org
-    del_y = right_eye_kp[1] - left_eye_kp[1]
-    del_x = right_eye_kp[0] - left_eye_kp[0]
-    eyes_angle = np.degrees(np.arctan2(del_y, del_x))
-
-    eyes_center = ((left_eye_kp[0] + right_eye_kp[0]) / 2.0, (left_eye_kp[1] + right_eye_kp[1]) / 2.0)
-    rotation_matrix = cv2.getRotationMatrix2D(center=eyes_center, angle=eyes_angle, scale=scaling_factor)
-
-    translated_x = rescaled_img_width * 0.5
-    translated_y = rescaled_img_left_eye_kp[1]
-    rotation_matrix[0, 2] = rotation_matrix[0, 2] + (translated_x - eyes_center[0])
-    rotation_matrix[1, 2] = rotation_matrix[1, 2] + (translated_y - eyes_center[1])
-
-    rotated_and_scaled_image = cv2.warpAffine(src=img, M=rotation_matrix, dsize=(rescaled_img_width, rescaled_img_width))
-    return rotated_and_scaled_image
-
-
-
-def extract_faces_from_video(video_path, num_faces=3):
-    detector = MTCNN()
-    cap = cv2.VideoCapture(video_path)
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+@app.route("/predict-image", methods=["POST"])
+def predict_image():
+    """
+    Image detection endpoint
+    Accepts: POST request with image file
+    Returns: JSON with prediction, confidence, and analysis details
+    """
     
-    faces = []
+    # Check if model is loaded
+    if model is None:
+        return jsonify({"error": "Model not loaded"}), 500
     
-    for idx in range(num_faces):
+    # Validate file presence
+    if "file" not in request.files:
+        return jsonify({"error": "No image uploaded"}), 400
+    
+    file = request.files["file"]
+    
+    # Validate filename
+    if file.filename == "":
+        return jsonify({"error": "No file selected"}), 400
+    
+    # Validate file extension
+    if not allowed_file(file.filename, ALLOWED_IMAGE_EXTENSIONS):
+        return jsonify({
+            "error": f"Invalid image format. Allowed: {', '.join(ALLOWED_IMAGE_EXTENSIONS)}"
+        }), 400
+    
+    try:
+        # Load and preprocess image
+        img = Image.open(file).convert("RGB")
+        processed_img = preprocess_image(img)
+        
+        if processed_img is None:
+            return jsonify({"error": "Failed to process image"}), 400
+        
+        # Make prediction
+        prediction = model.predict(processed_img, verbose=0)[0][0]
+        label, confidence = get_prediction_result(prediction)
+        
+        logger.info(f"Image prediction: {label} ({confidence}%)")
+        
+        return jsonify({
+            "label": label,
+            "confidence": confidence,
+            "filename": secure_filename(file.filename)
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Error in image prediction: {str(e)}")
+        return jsonify({"error": f"Prediction failed: {str(e)}"}), 500
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# VIDEO PREDICTION
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+@app.route("/predict-video", methods=["POST"])
+def predict_video():
+    """
+    Video detection endpoint
+    Analyzes video frames and detects deepfakes
+    Accepts: POST request with video file
+    Returns: JSON with overall prediction, frame analysis, and confidence
+    """
+    
+    # Check if model is loaded
+    if model is None:
+        return jsonify({"error": "Model not loaded"}), 500
+    
+    # Validate file presence
+    if "file" not in request.files:
+        return jsonify({"error": "No video uploaded"}), 400
+    
+    file = request.files["file"]
+    
+    # Validate filename
+    if file.filename == "":
+        return jsonify({"error": "No file selected"}), 400
+    
+    # Validate file extension
+    if not allowed_file(file.filename, ALLOWED_VIDEO_EXTENSIONS):
+        return jsonify({
+            "error": f"Invalid video format. Allowed: {', '.join(ALLOWED_VIDEO_EXTENSIONS)}"
+        }), 400
+    
+    video_path = None
+    cap = None
+    
+    try:
+        # Save uploaded file
+        filename = secure_filename(file.filename)
+        video_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(video_path)
+        
+        logger.info(f"Processing video: {filename}")
+        
+        # Open video
+        cap = cv2.VideoCapture(video_path)
+        
+        if not cap.isOpened():
+            return jsonify({"error": "Failed to open video file"}), 400
+        
+        # Get video properties
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        if total_frames == 0:
+            return jsonify({"error": "Video has no frames"}), 400
+        
+        # Analyze frames
+        fake_frames = 0
+        real_frames = 0
+        frame_count = 0
+        frames_analyzed = 0
+        
         while True:
-            frame_id = random.randint(0, frame_count-1)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_id)
             ret, frame = cap.read()
-
+            
             if not ret:
-                continue
-
-            img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-            result = detector.detect_faces(img)
-
-            if result:
-                rotated_and_scaled_image = croping_and_scaling(result[0], img)
-                face_filename = f"frame_{idx + 1}.jpg"  # Sequential filename
-                face_path = os.path.join('static', face_filename)
-                cv2.imwrite(face_path, rotated_and_scaled_image)
-                faces.append(face_path)
                 break
-
-    cap.release()
-    cv2.destroyAllWindows()
-    
-    return faces
-
-
-
-def extract_faces_from_image(image_path):
-    detector = MTCNN()
-    faces = []
-
-    image = cv2.imread(image_path)
-    if image is None:
-        print(f"Failed to read image: {image_path}")
-        return faces
-
-    img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-
-    results = detector.detect_faces(img_rgb)
-    if results is None:
-        print(f"No faces detected in the image: {image_path}")
-        return faces
-
-    for i, result in enumerate(results):
-        rotated_and_scaled_image = croping_and_scaling(result, img_rgb)
-        face_filename = f"image.jpg"
-        face_path = os.path.join('static', face_filename)
-        cv2.imwrite(face_path, rotated_and_scaled_image)
-        faces.append(face_path)
-
-    return faces
-
-
-
-@app.route('/classify', methods=['GET', 'POST'])
-def classify():
-    if request.method == 'POST':
-        image = request.files.get('image')
-        video = request.files.get('video')
-
-        if image:
-            print("Image uploaded")
-            image_path = os.path.join("uploads", image.filename)
-            image.save(image_path)
-
-            if os.path.exists(image_path):
-                faces = extract_faces_from_image(image_path)
-                if faces:
-                    face_paths = faces[0]
+            
+            frame_count += 1
+            
+            # Skip frames for efficiency
+            if frame_count % FRAME_SKIP != 0:
+                continue
+            
+            try:
+                # Preprocess frame
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = cv2.resize(frame, (IMG_SIZE, IMG_SIZE))
+                frame = frame.astype("float32") / 255.0
+                frame = np.expand_dims(frame, axis=0)
+                
+                # Predict
+                pred = model.predict(frame, verbose=0)[0][0]
+                
+                if pred < 0.5:
+                    fake_frames += 1
                 else:
-                    print(f"No face found")
-                    return render_template('main_1.html', error_message="No face found")
-                return redirect(url_for("process", face_paths=face_paths))
-            else:
-                print(f"File {image_path} does not exist.")
-                return render_template('main_1.html', error_message="Failed to process video.")
-
-
-
-        elif video:
-            print("Video uploaded")
-            video_path = os.path.join("uploads", video.filename)
-            video.save(video_path)
-
-            if os.path.exists(video_path):
-                faces = extract_faces_from_video(video_path, 3)
-                face_paths = ','.join(faces)
-                return redirect(url_for("process", face_paths=face_paths))
-            else:
-                print(f"File {video_path} does not exist.")
-                return render_template('main_1.html', error_message="Failed to process video.")
-
-    return render_template('main_1.html')
-
-
-@app.route('/process', methods=['GET', 'POST'])
-def process():
-    face_paths = request.args.get('face_paths')
-    print(face_paths)
-    face_paths = face_paths.split(',') if face_paths else []
-    print(face_paths)
-
-    detector = MTCNN()
-
-    model_path = 'svm_model.pkl'
-    model = joblib.load(model_path)
-
-    rotated_and_scaled_image = cv2.imread(face_paths[0])
-    if rotated_and_scaled_image is None:
-        print(f"Failed to read image: {face_paths[0]}")
-        return render_template('main_2.html', error_message="Failed to process video.")
-    result = detector.detect_faces(rotated_and_scaled_image)
-
-    blurred_img = cv2.GaussianBlur(rotated_and_scaled_image, (3, 3), 0.5)
-
-    nrmse = normalized_root_mse(rotated_and_scaled_image, blurred_img)
-    psnr = peak_signal_noise_ratio(rotated_and_scaled_image, blurred_img, data_range=255)
-    ssim = structural_similarity(rotated_and_scaled_image, blurred_img, channel_axis=2, gaussian_weights=True,
-                                    sigma=1.5, use_sample_covariance=False, data_range=255, win_size=7)
-
-    hist, bins = np.histogram(rotated_and_scaled_image.ravel(), 32, [0, 255], density=True)
-
-    feature_vector = np.concatenate([[nrmse], [psnr], [ssim], hist])
-
-    result = model.predict([feature_vector])
+                    real_frames += 1
+                
+                frames_analyzed += 1
+            
+            except Exception as e:
+                logger.warning(f"Error processing frame {frame_count}: {str(e)}")
+                continue
+        
+        cap.release()
+        
+        # Calculate results
+        if frames_analyzed == 0:
+            return jsonify({"error": "No frames could be analyzed"}), 400
+        
+        # Determine overall label
+        label = "FAKE" if fake_frames > real_frames else "REAL"
+        confidence = round(max(fake_frames, real_frames) / frames_analyzed * 100, 2)
+        
+        logger.info(f"Video analysis: {label} ({confidence}%) - {frames_analyzed} frames analyzed")
+        
+        return jsonify({
+            "label": label,
+            "confidence": confidence,
+            "frames_analyzed": frames_analyzed,
+            "fake_frames": fake_frames,
+            "real_frames": real_frames,
+            "filename": filename
+        }), 200
     
-    result = result[0]  
+    except Exception as e:
+        logger.error(f"Error in video prediction: {str(e)}")
+        return jsonify({"error": f"Video processing failed: {str(e)}"}), 500
+    
+    finally:
+        # Cleanup
+        if cap is not None:
+            cap.release()
+        
+        # Delete uploaded file after processing
+        if video_path and os.path.exists(video_path):
+            try:
+                os.remove(video_path)
+                logger.info(f"Deleted temporary file: {video_path}")
+            except Exception as e:
+                logger.warning(f"Could not delete file: {str(e)}")
 
-    return render_template('main_2.html', face_paths=face_paths, result=result)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ERROR HANDLERS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    """Handle file too large error"""
+    return jsonify({"error": "File too large. Maximum size is 500MB"}), 413
 
-if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
-    app.run(debug=True)
+@app.errorhandler(404)
+def not_found(error):
+    """Handle 404 error"""
+    return jsonify({"error": "Endpoint not found"}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    """Handle 500 error"""
+    return jsonify({"error": "Internal server error"}), 500
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# RUN SERVER
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+if __name__ == "__main__":
+    logger.info("🚀 Starting DeepShield Pro server...")
+    logger.info("📍 Server running at http://127.0.0.1:5000")
+    logger.info("🔧 Debug mode: ON")
+    
+    app.run(
+        debug=True,
+        host='127.0.0.1',
+        port=5000,
+        threaded=True
+    )
