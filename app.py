@@ -308,13 +308,17 @@ def internal_error(error):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 if __name__ == "__main__":
+    import os
+
+    port = int(os.environ.get("PORT", 5000))
+
     logger.info("🚀 Starting DeepShield Pro server...")
-    logger.info("📍 Server running at http://127.0.0.1:5000")
-    logger.info("🔧 Debug mode: ON")
-    
+    logger.info(f"📍 Server running on 0.0.0.0:{port}")
+    logger.info("🔧 Debug mode: OFF (production)")
+
     app.run(
-        debug=True,
-        host='127.0.0.1',
-        port=5000,
+        debug=False,          
+        host="0.0.0.0",       
+        port=port,
         threaded=True
     )
