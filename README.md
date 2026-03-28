@@ -13,6 +13,12 @@
 
 **Advanced AI-powered platform to detect deepfakes in images & videos instantly. Built with TensorFlow, Flask & MobileNetV2.**
 
+
+
+https://github.com/user-attachments/assets/8bc6f3ef-ccf1-4935-a232-d4013e7ef3f4
+
+
+
 </div>
 
 <br>
